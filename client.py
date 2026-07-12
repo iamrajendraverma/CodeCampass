@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import os
 import sys
 import threading
+import time
 
 try:
     # Importing readline transparently upgrades input() with line editing and
@@ -25,7 +27,15 @@ try:
 except ImportError:  # pragma: no cover
     readline = None
 
-from anthropic import Anthropic
+try:
+    # Needed to read a raw Esc keypress mid-request. Unix only; on Windows we
+    # simply run without the Esc-to-cancel feature.
+    import termios
+    import tty
+except ImportError:  # pragma: no cover
+    termios = tty = None
+
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -114,15 +124,129 @@ def mcp_tools_to_anthropic(mcp_tools) -> list[dict]:
     ]
 
 
-async def run_turn(
-    anthropic: Anthropic,
+class Usage:
+    """Running token tally for the whole session and the current turn."""
+
+    def __init__(self) -> None:
+        self.turn_in = self.turn_out = 0
+        self.total_in = self.total_out = 0
+
+    def start_turn(self) -> None:
+        self.turn_in = self.turn_out = 0
+
+    def add(self, u) -> None:
+        """Fold one API response's usage into the running totals."""
+        if not u:
+            return
+        self.turn_in += u.input_tokens
+        self.turn_out += u.output_tokens
+        self.total_in += u.input_tokens
+        self.total_out += u.output_tokens
+
+
+def _log_activity(msg: str) -> None:
+    """Print a line, first wiping any spinner text left on the current line."""
+    sys.stdout.write("\r\033[K")
+    print(msg)
+
+
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+async def _spinner(task: asyncio.Task, usage: Usage) -> None:
+    """Animate a progress line (elapsed + live token count) until `task` ends."""
+    start = time.monotonic()
+    i = 0
+    while not task.done():
+        elapsed = time.monotonic() - start
+        sys.stdout.write(
+            f"\r\033[2m  {_SPIN[i % len(_SPIN)]} working… {elapsed:4.1f}s"
+            f"   turn ↑{usage.turn_in:,} ↓{usage.turn_out:,}"
+            f"   (esc to cancel)\033[0m"
+        )
+        sys.stdout.flush()
+        i += 1
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            break
+    sys.stdout.write("\r\033[K")  # clear the spinner line
+    sys.stdout.flush()
+
+
+@contextlib.contextmanager
+def _esc_watcher(on_esc):
+    """While active, call on_esc() when the user presses Esc. Unix TTY only.
+
+    Puts the terminal in cbreak mode and watches stdin via the event loop so a
+    single keypress is delivered immediately (no Enter needed), then restores the
+    terminal on exit. A no-op on Windows / non-TTY stdin.
+    """
+    if termios is None or not sys.stdin.isatty():
+        yield
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    loop = asyncio.get_running_loop()
+
+    def _on_readable() -> None:
+        try:
+            data = os.read(fd, 1024)
+        except OSError:
+            return
+        if b"\x1b" in data:  # Esc (also the prefix of arrow keys — fine here)
+            on_esc()
+
+    try:
+        tty.setcbreak(fd)
+        loop.add_reader(fd, _on_readable)
+        yield
+    finally:
+        loop.remove_reader(fd)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+async def run_turn_interactive(
+    anthropic: AsyncAnthropic,
     session: ClientSession,
     tools: list[dict],
     messages: list[dict],
+    usage: Usage,
+) -> tuple[str, str]:
+    """Run one turn with a live spinner and Esc-to-cancel.
+
+    Returns (status, answer): status is "ok" (answer holds the text) or
+    "cancelled" (the user pressed Esc; answer is empty).
+    """
+    turn = asyncio.create_task(run_turn(anthropic, session, tools, messages, usage))
+    cancelled = False
+
+    def request_cancel() -> None:
+        nonlocal cancelled
+        cancelled = True
+        turn.cancel()
+
+    with _esc_watcher(request_cancel):
+        await _spinner(turn, usage)
+
+    try:
+        return "ok", await turn
+    except asyncio.CancelledError:
+        if cancelled:
+            return "cancelled", ""
+        raise  # a genuine outer cancellation (real Ctrl-C) — don't swallow it
+
+
+async def run_turn(
+    anthropic: AsyncAnthropic,
+    session: ClientSession,
+    tools: list[dict],
+    messages: list[dict],
+    usage: Usage,
 ) -> str:
     """Run one user turn to completion, executing any tool calls Claude requests."""
     while True:
-        response = anthropic.messages.create(
+        response = await anthropic.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPT,
@@ -130,6 +254,7 @@ async def run_turn(
             tools=tools,
             messages=messages,
         )
+        usage.add(response.usage)
 
         # Record the assistant turn (may contain text + tool_use blocks).
         messages.append({"role": "assistant", "content": response.content})
@@ -145,7 +270,7 @@ async def run_turn(
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"  \033[2m↳ calling {block.name}({_fmt_args(block.input)})\033[0m")
+            _log_activity(f"  \033[2m↳ calling {block.name}({_fmt_args(block.input)})\033[0m")
             try:
                 result = await session.call_tool(block.name, block.input)
                 content = "".join(
@@ -215,7 +340,7 @@ async def main() -> None:
     if not have_env and not have_profile:
         sys.exit(AUTH_HELP)
 
-    anthropic = Anthropic()
+    anthropic = AsyncAnthropic()
 
     # Log in to GitHub so the server can reach the user's private repos. If a
     # GITHUB_TOKEN is already set we reuse it; otherwise run the OAuth device
@@ -258,6 +383,7 @@ async def main() -> None:
                 f"Type 'quit' or press Ctrl-C to exit.{banner.RESET}\n"
             )
 
+            usage = Usage()
             messages: list[dict] = []
             while True:
                 try:
@@ -274,10 +400,13 @@ async def main() -> None:
                 if not user_input:
                     continue
 
-                checkpoint = len(messages)  # so we can roll back a failed turn
+                checkpoint = len(messages)  # so we can roll back a failed/cancelled turn
                 messages.append({"role": "user", "content": user_input})
+                usage.start_turn()
                 try:
-                    answer = await run_turn(anthropic, session, tools, messages)
+                    status, answer = await run_turn_interactive(
+                        anthropic, session, tools, messages, usage
+                    )
                 except Exception as exc:  # noqa: BLE001 - keep the REPL alive on any error
                     # Drop the partial turn so a half-finished tool exchange can't
                     # corrupt the conversation history on the next request.
@@ -286,7 +415,18 @@ async def main() -> None:
                         sys.exit(AUTH_HELP)  # config problem — no point looping
                     print(f"\n\033[31m⚠ request failed:\033[0m {exc}\n  (Try again or ask something else.)\n")
                     continue
-                print(f"\n\033[1mclaude ›\033[0m {answer}\n")
+
+                if status == "cancelled":
+                    # Roll back so the aborted exchange can't corrupt history.
+                    del messages[checkpoint:]
+                    print(f"\n  \033[33m✗ request cancelled.\033[0m\n")
+                    continue
+
+                print(f"\n\033[1mclaude ›\033[0m {answer}")
+                print(
+                    f"  \033[2m⛽ turn ↑{usage.turn_in:,} ↓{usage.turn_out:,}"
+                    f"   ·   session ↑{usage.total_in:,} ↓{usage.total_out:,}\033[0m\n"
+                )
 
 
 if __name__ == "__main__":
