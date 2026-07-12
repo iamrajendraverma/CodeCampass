@@ -27,6 +27,7 @@ TOOL_INFO: dict[str, tuple[str, str]] = {
     "get_readme":          ("▤", "Decoded README text (truncated)"),
     "list_commits":        ("◌", "Recent commits with messages & authors"),
     "list_collaborators":  ("◍", "Users with access to a repo & their roles"),
+    "search_commits_by_ticket": ("⌗", "Find commits by ticket id (DEV-#####)"),
 }
 
 

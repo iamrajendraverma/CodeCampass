@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import sys
 
 import httpx
@@ -51,6 +52,17 @@ def _get(path: str, params: dict | None = None) -> dict | list:
         raise RuntimeError(f"Not found: {path}")
     resp.raise_for_status()
     return resp.json()
+
+
+# A ticket id such as "DEV-16397" — the "DEV-" prefix is optional on input so a
+# bare number ("16397") is accepted too. Digit count is left flexible.
+_TICKET_RE = re.compile(r"^(?:DEV-)?(\d{3,})$", re.IGNORECASE)
+
+
+def _normalize_ticket(ticket: str) -> str | None:
+    """Return a canonical 'DEV-#####' id, or None if the input isn't a ticket."""
+    m = _TICKET_RE.match(ticket.strip())
+    return f"DEV-{m.group(1)}" if m else None
 
 
 def _highest_permission(perms: dict) -> str:
@@ -258,6 +270,65 @@ def list_collaborators(owner: str, repo: str, limit: int = 30) -> str:
     for u in users:
         role = u.get("role_name") or _highest_permission(u.get("permissions") or {})
         lines.append(f"- {u['login']}  [{role}]\n    {u.get('html_url', '')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def search_commits_by_ticket(owner: str, repo: str, ticket_id: str, limit: int = 10) -> str:
+    """Find commits in a repository whose message references a ticket id.
+
+    Ticket ids look like "DEV-16397". Use this to trace which commits implemented
+    or mentioned a given ticket. Accepts the full id ("DEV-16397") or just the
+    number ("16397"). Searches the commit messages via GitHub's commit search.
+
+    Args:
+        owner: Repository owner (user or organization).
+        repo: Repository name.
+        ticket_id: Ticket id such as "DEV-16397" (or just "16397").
+        limit: Maximum number of commits to return (1-30).
+    """
+    ticket = _normalize_ticket(ticket_id)
+    if not ticket:
+        return f"Invalid ticket id {ticket_id!r}. Expected something like 'DEV-16397'."
+    # GitHub's commit search API rejects unauthenticated requests (422), so require
+    # a login up front rather than surfacing a confusing validation error.
+    if not os.environ.get("GITHUB_TOKEN"):
+        return (
+            "Searching commits requires being logged in to GitHub. Restart the "
+            "client and complete the login (or set a GITHUB_TOKEN), then try again."
+        )
+    limit = max(1, min(limit, 30))
+    try:
+        data = _get(
+            "/search/commits",
+            {"q": f'"{ticket}" repo:{owner}/{repo}', "per_page": limit},
+        )
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in (401, 403):
+            return (
+                f"Not allowed to search commits in {owner}/{repo}. Private repos "
+                "require logging in with a GITHUB_TOKEN that can see the repo."
+            )
+        if code == 422:
+            return (
+                f"Couldn't search commits in {owner}/{repo}. Check the repo exists "
+                "and that your GitHub login can see it (private repos need 'repo' scope)."
+            )
+        raise
+    items = data.get("items", []) if isinstance(data, dict) else []
+    if not items:
+        return f"No commits referencing {ticket} found in {owner}/{repo}."
+    lines = [f"Commits referencing {ticket} in {owner}/{repo} (showing {len(items)}):", ""]
+    for c in items:
+        sha = c["sha"][:7]
+        commit = c.get("commit", {})
+        message = (commit.get("message") or "").splitlines()[0]
+        author = (commit.get("author") or {}).get("name", "unknown")
+        date = (commit.get("author") or {}).get("date", "")
+        lines.append(
+            f"- {sha}  {message}\n    by {author} on {date}\n    {c.get('html_url', '')}"
+        )
     return "\n".join(lines)
 
 
