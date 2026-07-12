@@ -26,9 +26,11 @@ Think of it like USB for LLM tools: build the server once, plug it into any host
 
 In this project:
 
-- **`server.py`** is an MCP **server** that exposes 5 GitHub tools.
+- **`server.py`** is an MCP **server** that exposes 9 GitHub tools.
 - **`client.py`** is an MCP **client** (and also an LLM host) that connects to the
-  server and lets Claude use those tools.
+  server and lets Claude use those tools, with a rich terminal UI.
+- **`github_auth.py`** is an optional GitHub OAuth device-flow login so those tools
+  can reach your private repos.
 
 ---
 
@@ -59,13 +61,14 @@ MCP messages can travel over different **transports**. The two common ones:
 - **HTTP/SSE**: the server runs as a network service. Use this when the server is
   remote or shared.
 
-We use **stdio**, so `client.py` literally spawns `server.py` as a child process:
+We use **stdio**, so `client.py` literally spawns `server.py` as a child process
+(after an optional GitHub login — see §6):
 
 ```python
 server_params = StdioServerParameters(
     command=sys.executable,   # the same Python interpreter (from our uv venv)
     args=["server.py"],
-    env=os.environ.copy(),    # pass GITHUB_TOKEN through to the child
+    env=server_env,           # includes GITHUB_TOKEN (from the login or .env)
 )
 ```
 
@@ -82,7 +85,7 @@ We use `FastMCP`, a high-level helper from the MCP SDK. It turns an ordinary Pyt
 function into an MCP tool via a decorator:
 
 ```python
-mcp = FastMCP("github")
+mcp = FastMCP("codecompass")
 
 @mcp.tool()
 def get_repo_info(owner: str, repo: str) -> str:
@@ -186,11 +189,13 @@ Claude responds
       append results to the conversation, loop again
 ```
 
-In code, condensed:
+In code, condensed (the client uses the **async** SDK, `AsyncAnthropic`, so the
+request is awaitable — which is also what lets **Esc** cancel it mid-flight):
 
 ```python
 while True:
-    response = anthropic.messages.create(..., tools=tools, messages=messages)
+    response = await anthropic.messages.create(..., tools=tools, messages=messages)
+    usage.add(response.usage)                # track token consumption
     messages.append({"role": "assistant", "content": response.content})
 
     if response.stop_reason != "tool_use":
@@ -220,21 +225,76 @@ A few details that are easy to get wrong:
 
 ### Step 4 — Credentials
 
-The client constructs `Anthropic()` with no arguments. The SDK then resolves
+The client constructs `AsyncAnthropic()` with no arguments. The SDK resolves
 credentials in order: `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → an
-`ant auth login` profile. We don't pre-check a specific env var; instead we catch
-`AuthenticationError` at call time and print guidance. (This is why the earlier
-"ANTHROPIC_API_KEY is not set" hard-guard was removed — it wrongly rejected valid
-profile-based credentials.)
+`ant auth login` profile. On startup we fail fast **only** when *none* of those
+exist (we check for either env var **or** a `~/.config/anthropic` profile), so
+valid profile-based credentials aren't wrongly rejected. A mid-session safety net
+still catches `AuthenticationError` at call time and prints guidance.
 
 ---
 
-## 6. Full request lifecycle (worked example)
+## 6. GitHub authentication (`github_auth.py`)
+
+The tools work anonymously against public data (GitHub allows 60 requests/hour).
+To reach **private** repos — or use tools that require auth like
+`search_commits_by_ticket` — the client needs a GitHub token. There are two paths,
+resolved in `main()` before the server is spawned:
+
+1. **`GITHUB_TOKEN` already set** (env or `.env`) → reuse it directly.
+2. **Otherwise, run the OAuth device flow** (`github_auth.login()`):
+   - The client asks GitHub for a device + user code (`POST /login/device/code`).
+   - It prints a short code and `github.com/login/device`; you approve in a browser.
+   - It polls `POST /login/oauth/access_token` until you approve, then returns a
+     user access token carrying *your* permissions.
+
+The token is placed into the environment passed to `server.py`, so the server's
+`_get()` sends it as a Bearer token. Device flow needs a registered OAuth App
+client id (`GITHUB_CLIENT_ID`) with device flow enabled; if that's missing or the
+user skips the prompt, the client continues in public-only mode — login is never
+fatal.
+
+```python
+if server_env.get("GITHUB_TOKEN"):
+    ...                                   # reuse it
+else:
+    try:
+        token = await asyncio.to_thread(github_auth.login)   # blocking poll off the loop
+        server_env["GITHUB_TOKEN"] = token
+    except github_auth.DeviceFlowError:
+        ...                               # fall back to public data
+```
+
+---
+
+## 7. The terminal UI
+
+`client.py` is more than a print loop — it's a small interactive app:
+
+- **Rendered markdown.** Claude's answers are markdown, so they're rendered with
+  [`rich`](https://github.com/Textualize/rich): headings, lists, tables, links, and
+  syntax-highlighted code blocks inside a panel — instead of raw `##`/`**` text.
+  The startup tool inventory is a `rich` table.
+- **Command history.** Importing `readline` upgrades `input()` with line editing
+  and **↑/↓** recall; history is saved to `~/.codecompass_history` between runs.
+- **Progress + token usage.** While a turn runs, a spinner shows elapsed time and a
+  live token count; after each answer the panel footer shows `turn` and `session`
+  input/output token totals (summed from each response's `usage`).
+- **Esc to cancel.** Each turn runs as an `asyncio` task. A watcher puts the
+  terminal in cbreak mode and, on **Esc**, cancels the task — which works because
+  the request uses `AsyncAnthropic` and is genuinely awaitable. A cancelled turn is
+  rolled back so a half-finished tool exchange can't corrupt the history.
+- **Non-blocking input.** Input is read on a daemon thread so the event loop keeps
+  servicing the MCP stdio transport while waiting for you to type.
+
+---
+
+## 8. Full request lifecycle (worked example)
 
 You type: *"What are the top 2 open issues on modelcontextprotocol/python-sdk?"*
 
 ```
-1. client.py: append your message, call Claude with the 5 tool schemas.
+1. client.py: append your message, call Claude with the 9 tool schemas.
 2. Claude: "I need to call list_issues(owner=..., repo=..., limit=2)."
    → stop_reason = "tool_use"
 3. client.py: session.call_tool("list_issues", {...})
@@ -251,7 +311,7 @@ to use; it decides from the descriptions.
 
 ---
 
-## 7. Why one detail was subtle: the `list_issues` PR bug
+## 9. Why one detail was subtle: the `list_issues` PR bug
 
 GitHub's "issues" REST endpoint returns **pull requests too** (GitHub models PRs as
 a kind of issue). The first version fetched `per_page=limit` and then filtered PRs
@@ -268,9 +328,18 @@ issues = [i for i in data if "pull_request" not in i][:limit]
 This is a good example of why you verify tools against real data — the schema and
 the happy path looked fine; only a live call revealed the interleaving.
 
+**A second instance of the same lesson: merged vs. closed PRs.** GitHub has no
+"merged" PR *state* — a merged PR is a *closed* PR whose `merged_at` is set. An
+early version of `list_pull_requests` paged the closed list and split it by
+`merged_at`, but on a repo whose most recent closed PRs were all *unmerged*, the
+merged ones fell outside the fetched page and "merged" came back empty. The fix was
+to let GitHub filter server-side via the search API (`is:merged` /
+`is:closed is:unmerged`) instead of paging-and-filtering. Same moral: test against
+a real, busy repo.
+
 ---
 
-## 8. How to extend it
+## 10. How to extend it
 
 **Add a tool:** write a new decorated function in `server.py`. It appears in the
 client automatically — no client changes needed.
@@ -291,7 +360,7 @@ it to live on a different machine.
 
 ---
 
-## 9. Glossary
+## 11. Glossary
 
 - **MCP** — Model Context Protocol; the standard for exposing tools/data to LLM apps.
 - **Server** — exposes tools (`server.py`).
