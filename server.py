@@ -78,6 +78,48 @@ def search_repositories(query: str, limit: int = 5) -> str:
 
 
 @mcp.tool()
+def list_my_repositories(visibility: str = "all", sort: str = "updated", limit: int = 10) -> str:
+    """List repositories the logged-in GitHub user can access, including PRIVATE ones.
+
+    Use this for questions about "my repos" or private repositories. Requires the
+    user to be logged in (a GITHUB_TOKEN with 'repo' scope). GitHub's public search
+    does not reliably surface private repos, so this endpoint is the way to reach them.
+
+    Args:
+        visibility: Which repos to include: "all", "public", or "private".
+        sort: Sort order: "created", "updated", "pushed", or "full_name".
+        limit: Maximum number of repositories to return (1-30).
+    """
+    if not os.environ.get("GITHUB_TOKEN"):
+        return (
+            "Not logged in to GitHub, so private repositories aren't available. "
+            "Restart the client and complete the GitHub login prompt, then try again."
+        )
+    if visibility not in ("all", "public", "private"):
+        return f"Invalid visibility {visibility!r}. Use 'all', 'public', or 'private'."
+    if sort not in ("created", "updated", "pushed", "full_name"):
+        return f"Invalid sort {sort!r}. Use 'created', 'updated', 'pushed', or 'full_name'."
+    limit = max(1, min(limit, 30))
+    data = _get(
+        "/user/repos",
+        {"visibility": visibility, "sort": sort, "per_page": limit},
+    )
+    repos = data if isinstance(data, list) else []
+    if not repos:
+        return f"No repositories found for the logged-in user (visibility={visibility})."
+    lines = [f"Your repositories (visibility={visibility}, showing {len(repos)}):", ""]
+    for r in repos:
+        vis = "private" if r.get("private") else "public"
+        lines.append(
+            f"- {r['full_name']}  ★{r['stargazers_count']}  "
+            f"[{r.get('language') or 'n/a'}]  ({vis})\n"
+            f"    {r.get('description') or '(no description)'}\n"
+            f"    {r['html_url']}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def get_repo_info(owner: str, repo: str) -> str:
     """Get summary information about a specific repository.
 

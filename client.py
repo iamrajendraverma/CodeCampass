@@ -23,6 +23,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 import banner
+import github_auth
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
@@ -170,11 +171,28 @@ async def main() -> None:
 
     anthropic = Anthropic()
 
+    # Log in to GitHub so the server can reach the user's private repos. If a
+    # GITHUB_TOKEN is already set we reuse it; otherwise run the OAuth device
+    # flow. A failed/skipped login is non-fatal — we just fall back to public
+    # data (unauthenticated → 60 requests/hour, public repos only).
+    server_env = os.environ.copy()
+    if server_env.get("GITHUB_TOKEN"):
+        print(f"  {banner.DIM}Using GITHUB_TOKEN from the environment.{banner.RESET}")
+    else:
+        try:
+            token = await asyncio.to_thread(github_auth.login)
+            server_env["GITHUB_TOKEN"] = token
+        except github_auth.DeviceFlowError as exc:
+            print(f"  {banner.YELLOW}⚠ GitHub login unavailable:{banner.RESET} {exc}")
+            print(f"  {banner.DIM}Continuing with public data only.{banner.RESET}\n")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print(f"\n  {banner.DIM}Login skipped — continuing with public data only.{banner.RESET}\n")
+
     # Launch server.py in the same interpreter/venv over stdio.
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["server.py"],
-        env=os.environ.copy(),  # pass through GITHUB_TOKEN if present
+        env=server_env,  # pass through GITHUB_TOKEN (from env or the login above)
     )
 
     async with stdio_client(server_params) as (read, write):

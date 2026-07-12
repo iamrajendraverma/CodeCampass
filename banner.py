@@ -21,6 +21,7 @@ _W = 54  # inner width of the framed banner
 # Display metadata for each tool: (single-width glyph, one-line blurb).
 TOOL_INFO: dict[str, tuple[str, str]] = {
     "search_repositories": ("◎", "Search public repositories by keyword"),
+    "list_my_repositories":("★", "Your repos, incl. private (needs login)"),
     "get_repo_info":       ("◆", "Stars, forks, language, license, issues"),
     "list_issues":         ("◈", "Open/closed issues with authors & labels"),
     "get_readme":          ("▤", "Decoded README text (truncated)"),
