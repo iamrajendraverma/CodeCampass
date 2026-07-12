@@ -79,6 +79,13 @@ def _highest_permission(perms: dict) -> str:
     return "read"
 
 
+def _pr_label(pr: dict) -> str:
+    """Classify a PR as 'merged', 'closed' (without merging), or 'open'."""
+    if pr.get("merged_at"):
+        return "merged"
+    return "closed" if pr.get("state") == "closed" else "open"
+
+
 @mcp.tool()
 def search_repositories(query: str, limit: int = 5) -> str:
     """Search public GitHub repositories.
@@ -328,6 +335,73 @@ def search_commits_by_ticket(owner: str, repo: str, ticket_id: str, limit: int =
         date = (commit.get("author") or {}).get("date", "")
         lines.append(
             f"- {sha}  {message}\n    by {author} on {date}\n    {c.get('html_url', '')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_pull_requests(owner: str, repo: str, state: str = "open", limit: int = 10) -> str:
+    """List pull requests in a repository by state.
+
+    Use this for questions about PRs. States:
+      - "open":   PRs still awaiting review/merge.
+      - "merged": PRs that were closed AND merged.
+      - "closed": PRs that were closed WITHOUT merging (rejected/abandoned).
+      - "all":    every PR regardless of state.
+    (In GitHub a merged PR is a closed PR whose merge went through, so "closed"
+    here excludes merged ones.)
+
+    Args:
+        owner: Repository owner (user or organization).
+        repo: Repository name.
+        state: One of "open", "merged", "closed", or "all".
+        limit: Maximum number of PRs to return (1-30).
+    """
+    # Map each state to GitHub search qualifiers so the API does the filtering —
+    # in particular "is:merged" vs "is:closed is:unmerged", which can't be told
+    # apart reliably by paging the /pulls endpoint.
+    qualifiers = {
+        "open": ["is:open"],
+        "merged": ["is:merged"],
+        "closed": ["is:closed", "is:unmerged"],
+        "all": [],
+    }
+    if state not in qualifiers:
+        return f"Invalid state {state!r}. Use one of: {', '.join(qualifiers)}."
+    limit = max(1, min(limit, 30))
+    q = " ".join([f"repo:{owner}/{repo}", "is:pr", *qualifiers[state]])
+    try:
+        data = _get(
+            "/search/issues",
+            {"q": q, "per_page": limit, "sort": "updated", "order": "desc"},
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403, 422):
+            return (
+                f"Couldn't search pull requests in {owner}/{repo}. Check the repo "
+                "exists and that your GitHub login can see it (private repos need "
+                "a GITHUB_TOKEN with 'repo' scope)."
+            )
+        raise
+    items = data.get("items", []) if isinstance(data, dict) else []
+    if not items:
+        return f"No {state} pull requests found for {owner}/{repo}."
+    total = data.get("total_count", len(items))
+    lines = [f"{state.capitalize()} PRs for {owner}/{repo} ({total} total, showing {len(items)}):", ""]
+    for p in items:
+        pr = p.get("pull_request") or {}
+        label = _pr_label({"merged_at": pr.get("merged_at"), "state": p.get("state")})
+        author = (p.get("user") or {}).get("login", "unknown")
+        if label == "merged":
+            when = f"merged {pr.get('merged_at', '')}"
+        elif label == "closed":
+            when = f"closed {p.get('closed_at', '')}"
+        else:
+            when = f"opened {p.get('created_at', '')}"
+        lines.append(
+            f"- #{p['number']} {p['title']}  [{label}]\n"
+            f"    by {author} · {when}\n"
+            f"    {p['html_url']}"
         )
     return "\n".join(lines)
 
