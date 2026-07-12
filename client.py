@@ -13,9 +13,17 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import sys
 import threading
+
+try:
+    # Importing readline transparently upgrades input() with line editing and
+    # ↑/↓ history recall. Absent on some bare Windows installs — degrade quietly.
+    import readline
+except ImportError:  # pragma: no cover
+    readline = None
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -42,6 +50,43 @@ AUTH_HELP = (
     "  2) Or export it in your shell (use 'export' so child processes inherit it):\n"
     "       export ANTHROPIC_API_KEY=sk-ant-...\n"
 )
+
+
+HISTORY_FILE = os.path.expanduser("~/.codecompass_history")
+
+# readline needs non-printing bytes wrapped in \001..\002 so it computes the
+# prompt width correctly; otherwise recalling long history lines corrupts the
+# display. Only emit the markers when readline is actually active.
+if readline is not None:
+    PROMPT = "\001\033[1m\002you ›\001\033[0m\002 "
+else:
+    PROMPT = "\033[1myou ›\033[0m "
+
+
+def _setup_history() -> None:
+    """Load past REPL queries and persist new ones so ↑/↓ recall them.
+
+    input() already records each line into readline's in-memory history (so ↑/↓
+    work within a session as soon as readline is imported); this just seeds that
+    history from a file on startup and writes it back on exit.
+    """
+    if readline is None:
+        return
+    try:
+        readline.read_history_file(HISTORY_FILE)
+    except (FileNotFoundError, OSError):
+        pass  # no prior history, or unreadable — start fresh
+    readline.set_history_length(1000)
+    atexit.register(_save_history)
+
+
+def _save_history() -> None:
+    if readline is None:
+        return
+    try:
+        readline.write_history_file(HISTORY_FILE)
+    except OSError:
+        pass
 
 
 def _looks_like_auth_error(exc: Exception) -> bool:
@@ -160,6 +205,7 @@ async def _ainput(prompt: str) -> str:
 
 async def main() -> None:
     load_dotenv()
+    _setup_history()  # enable ↑/↓ query history in the prompt
     # The SDK resolves credentials from ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
     # or an `ant auth login` profile. Fail fast with clear instructions when none
     # of those exist, so the user isn't shown the UI only to hit a cryptic SDK
@@ -218,7 +264,7 @@ async def main() -> None:
                     # Read input off the event loop so it keeps servicing the MCP
                     # stdio transport while we wait for the user. CancelledError is
                     # what a Ctrl+C delivers here (asyncio cancels the main task).
-                    user_input = (await _ainput("\033[1myou ›\033[0m ")).strip()
+                    user_input = (await _ainput(PROMPT)).strip()
                 except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
                     print("\nBye.")
                     break
