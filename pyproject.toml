@@ -8,4 +8,5 @@ dependencies = [
     "anthropic>=0.116.0",
     "httpx>=0.28.1",
     "mcp>=1.28.1",
+    "rich>=15.0.0",
 ]

@@ -39,9 +39,19 @@ from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from rich.box import ROUNDED, SIMPLE_HEAVY
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 import banner
 import github_auth
+
+# Single shared console renders all rich output (markdown answers, tables, panels).
+console = Console()
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
@@ -124,6 +134,24 @@ def mcp_tools_to_anthropic(mcp_tools) -> list[dict]:
     ]
 
 
+def _tools_table(tools: list[dict]) -> Table:
+    """Build a clean two-column table of the available tools."""
+    table = Table(
+        box=SIMPLE_HEAVY,
+        title="Available tools",
+        title_style="bold",
+        header_style="bold cyan",
+        pad_edge=False,
+        expand=False,
+    )
+    table.add_column("Tool", style="bold cyan", no_wrap=True)
+    table.add_column("What it does", style="dim")
+    for t in tools:
+        blurb = (t["description"] or "").strip().splitlines()[0] if t["description"] else ""
+        table.add_row(t["name"], blurb)
+    return table
+
+
 class Usage:
     """Running token tally for the whole session and the current turn."""
 
@@ -144,10 +172,17 @@ class Usage:
         self.total_out += u.output_tokens
 
 
-def _log_activity(msg: str) -> None:
-    """Print a line, first wiping any spinner text left on the current line."""
+def _log_tool(name: str, args: str) -> None:
+    """Print a styled 'calling tool' line, wiping any spinner text first.
+
+    Uses Text.append (not markup) so tool arguments containing brackets/quotes
+    can't be misread as rich markup.
+    """
     sys.stdout.write("\r\033[K")
-    print(msg)
+    line = Text("  ↳ calling ", style="dim")
+    line.append(name, style="bold cyan")
+    line.append(f"({args})", style="dim")
+    console.print(line)
 
 
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -270,7 +305,7 @@ async def run_turn(
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            _log_activity(f"  \033[2m↳ calling {block.name}({_fmt_args(block.input)})\033[0m")
+            _log_tool(block.name, _fmt_args(block.input))
             try:
                 result = await session.call_tool(block.name, block.input)
                 content = "".join(
@@ -374,13 +409,11 @@ async def main() -> None:
 
             print(banner.banner(f"interactive client · {MODEL}"))
             print()
-            print(banner.tools_panel(
-                [t["name"] for t in tools],
-                {t["name"]: t["description"] for t in tools},
-            ))
-            print(
-                f"\n  {banner.DIM}Ask about repos, issues, commits, or READMEs. "
-                f"Type 'quit' or press Ctrl-C to exit.{banner.RESET}\n"
+            console.print(_tools_table(tools))
+            console.print(
+                "\n[dim]Ask about repos, issues, commits, or READMEs. "
+                "Type [/dim][bold]quit[/bold][dim] or press [/dim][bold]Ctrl-C[/bold]"
+                "[dim] to exit.[/dim]\n"
             )
 
             usage = Usage()
@@ -413,20 +446,35 @@ async def main() -> None:
                     del messages[checkpoint:]
                     if _looks_like_auth_error(exc):
                         sys.exit(AUTH_HELP)  # config problem — no point looping
-                    print(f"\n\033[31m⚠ request failed:\033[0m {exc}\n  (Try again or ask something else.)\n")
+                    console.print(Panel(
+                        f"[red]{escape(str(exc))}[/red]\n"
+                        "[dim]Try again or ask something else.[/dim]",
+                        title="⚠ request failed",
+                        title_align="left",
+                        border_style="red",
+                        box=ROUNDED,
+                    ))
                     continue
 
                 if status == "cancelled":
                     # Roll back so the aborted exchange can't corrupt history.
                     del messages[checkpoint:]
-                    print(f"\n  \033[33m✗ request cancelled.\033[0m\n")
+                    console.print("\n[yellow]✗ request cancelled.[/yellow]\n")
                     continue
 
-                print(f"\n\033[1mclaude ›\033[0m {answer}")
-                print(
-                    f"  \033[2m⛽ turn ↑{usage.turn_in:,} ↓{usage.turn_out:,}"
-                    f"   ·   session ↑{usage.total_in:,} ↓{usage.total_out:,}\033[0m\n"
-                )
+                console.print(Panel(
+                    Markdown(answer or "_(no answer)_"),
+                    title="[bold]techment[/bold]",
+                    title_align="left",
+                    subtitle=(
+                        f"[dim]turn ↑{usage.turn_in:,} ↓{usage.turn_out:,}"
+                        f"  ·  session ↑{usage.total_in:,} ↓{usage.total_out:,}[/dim]"
+                    ),
+                    subtitle_align="right",
+                    border_style="cyan",
+                    box=ROUNDED,
+                    padding=(1, 2),
+                ))
 
 
 if __name__ == "__main__":
