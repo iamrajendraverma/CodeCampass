@@ -53,6 +53,20 @@ def _get(path: str, params: dict | None = None) -> dict | list:
     return resp.json()
 
 
+def _highest_permission(perms: dict) -> str:
+    """Map GitHub's boolean permission flags to a single human-readable role."""
+    for flag, label in (
+        ("admin", "admin"),
+        ("maintain", "maintain"),
+        ("push", "write"),
+        ("triage", "triage"),
+        ("pull", "read"),
+    ):
+        if perms.get(flag):
+            return label
+    return "read"
+
+
 @mcp.tool()
 def search_repositories(query: str, limit: int = 5) -> str:
     """Search public GitHub repositories.
@@ -209,6 +223,41 @@ def list_commits(owner: str, repo: str, limit: int = 10) -> str:
         author = c["commit"]["author"]["name"]
         date = c["commit"]["author"]["date"]
         lines.append(f"- {sha}  {message}\n    by {author} on {date}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_collaborators(owner: str, repo: str, limit: int = 30) -> str:
+    """List the users (collaborators) associated with a repository.
+
+    Use this for "who has access to", "who works on", or "who are the members of"
+    a repo. Shows each user's login and permission level (admin, maintain, write,
+    triage, or read). Listing collaborators requires access to the repo; private
+    repos need the user to be logged in with a GITHUB_TOKEN that has 'repo' scope.
+
+    Args:
+        owner: Repository owner (user or organization).
+        repo: Repository name.
+        limit: Maximum number of collaborators to return (1-100).
+    """
+    limit = max(1, min(limit, 100))
+    try:
+        data = _get(f"/repos/{owner}/{repo}/collaborators", {"per_page": limit})
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            return (
+                f"Not allowed to list collaborators for {owner}/{repo}. Listing "
+                "collaborators requires access to the repository — log in with a "
+                "GITHUB_TOKEN that can see it (private repos need 'repo' scope)."
+            )
+        raise
+    users = data if isinstance(data, list) else []
+    if not users:
+        return f"No collaborators found for {owner}/{repo}."
+    lines = [f"Collaborators on {owner}/{repo} (showing {len(users)}):", ""]
+    for u in users:
+        role = u.get("role_name") or _highest_permission(u.get("permissions") or {})
+        lines.append(f"- {u['login']}  [{role}]\n    {u.get('html_url', '')}")
     return "\n".join(lines)
 
 

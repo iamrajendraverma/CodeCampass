@@ -26,6 +26,7 @@ TOOL_INFO: dict[str, tuple[str, str]] = {
     "list_issues":         ("◈", "Open/closed issues with authors & labels"),
     "get_readme":          ("▤", "Decoded README text (truncated)"),
     "list_commits":        ("◌", "Recent commits with messages & authors"),
+    "list_collaborators":  ("◍", "Users with access to a repo & their roles"),
 }
 
 
