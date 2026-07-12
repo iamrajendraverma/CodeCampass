@@ -1,0 +1,11 @@
+[project]
+name = "codecompass"
+version = "0.1.0"
+description = "CodeCompass — navigate GitHub with Claude via an MCP server + LLM-powered client"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.116.0",
+    "httpx>=0.28.1",
+    "mcp>=1.28.1",
+]
