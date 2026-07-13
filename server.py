@@ -24,6 +24,13 @@ import banner
 GITHUB_API = "https://api.github.com"
 USER_AGENT = "codecompass/1.0"
 
+# Jira Cloud REST API v3. Configured via env vars (see .env.example):
+#   JIRA_BASE_URL   e.g. https://bechprep.atlassian.net
+#   JIRA_EMAIL      the Atlassian account that owns the API token
+#   JIRA_API_TOKEN  https://id.atlassian.com/manage-profile/security/api-tokens
+# Cloud uses HTTP Basic auth with email:token (not a password).
+JIRA_API = "/rest/api/3"
+
 mcp = FastMCP("codecompass")
 
 
@@ -52,6 +59,82 @@ def _get(path: str, params: dict | None = None) -> dict | list:
         raise RuntimeError(f"Not found: {path}")
     resp.raise_for_status()
     return resp.json()
+
+
+def _jira_config() -> tuple[str, str, str]:
+    """Return (base_url, email, token) or raise a readable error if unset."""
+    base = (os.environ.get("JIRA_BASE_URL") or "").rstrip("/")
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not (base and email and token):
+        raise RuntimeError(
+            "Jira is not configured. Set JIRA_BASE_URL, JIRA_EMAIL, and "
+            "JIRA_API_TOKEN in your .env (see .env.example)."
+        )
+    return base, email, token
+
+
+def _jira_client() -> httpx.Client:
+    """Build an httpx client for Jira Cloud (Basic auth with email:token)."""
+    base, email, token = _jira_config()
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    # httpx encodes the (email, token) tuple as an HTTP Basic auth header.
+    return httpx.Client(base_url=base, headers=headers, auth=(email, token), timeout=30.0)
+
+
+def _jira_get(path: str, params: dict | None = None) -> dict | list:
+    """GET a Jira endpoint, mapping common failures to readable errors."""
+    with _jira_client() as client:
+        resp = client.get(path, params=params)
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "Jira authentication failed (401). Check JIRA_EMAIL and JIRA_API_TOKEN "
+            "— Cloud needs the account email plus an API token (not your password)."
+        )
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "Jira access forbidden (403). Your account may lack permission to view "
+            "this project or issue."
+        )
+    if resp.status_code == 404:
+        raise RuntimeError(f"Not found in Jira: {path}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _jira_browse_url(key: str) -> str:
+    """Human-facing Jira issue URL, e.g. https://acme.atlassian.net/browse/DEV-1."""
+    base = (os.environ.get("JIRA_BASE_URL") or "").rstrip("/")
+    return f"{base}/browse/{key}" if base else key
+
+
+def _resolve_assignee(assignee: str) -> tuple[str | None, str]:
+    """Resolve an email or display name to a Jira accountId.
+
+    Jira Cloud identifies users by opaque accountId (emails/usernames were
+    removed from most APIs for privacy). Returns (accountId, display_label);
+    accountId is None when no user matches the query.
+    """
+    data = _jira_get("/rest/api/3/user/search", {"query": assignee})
+    users = data if isinstance(data, list) else []
+    if users:
+        u = users[0]
+        return u.get("accountId"), u.get("displayName") or assignee
+    return None, assignee
+
+
+def _jql_in_clause(field: str, value: str) -> str | None:
+    """Build a quoted `field in (...)` JQL clause from a comma-separated value.
+
+    Returns None for an empty value or "all" (meaning: no filter on this field).
+    """
+    if not value or value.strip().lower() == "all":
+        return None
+    items = [v.strip() for v in value.split(",") if v.strip()]
+    if not items:
+        return None
+    quoted = ", ".join(f'"{v}"' for v in items)
+    return f"{field} in ({quoted})"
 
 
 # A ticket id such as "DEV-16397" — the "DEV-" prefix is optional on input so a
@@ -403,6 +486,148 @@ def list_pull_requests(owner: str, repo: str, state: str = "open", limit: int = 
             f"    by {author} · {when}\n"
             f"    {p['html_url']}"
         )
+    return "\n".join(lines)
+
+
+def _fmt_jira_issue(issue: dict, *, detailed: bool = False) -> str:
+    """Format one Jira issue's fields into a readable block."""
+    key = issue.get("key", "?")
+    f = issue.get("fields") or {}
+    summary = f.get("summary") or "(no summary)"
+    itype = (f.get("issuetype") or {}).get("name") or "Issue"
+    status = (f.get("status") or {}).get("name") or "Unknown"
+    category = ((f.get("status") or {}).get("statusCategory") or {}).get("name")
+    status_str = f"{status} ({category})" if category else status
+    assignee = (f.get("assignee") or {}).get("displayName") or "Unassigned"
+    if not detailed:
+        return (
+            f"- {key}  [{itype}]  {summary}\n"
+            f"    status: {status_str}  ·  assignee: {assignee}\n"
+            f"    {_jira_browse_url(key)}"
+        )
+    priority = (f.get("priority") or {}).get("name") or "n/a"
+    reporter = (f.get("reporter") or {}).get("displayName") or "n/a"
+    resolution = (f.get("resolution") or {}).get("name") or "Unresolved"
+    parent = f.get("parent") or {}
+    parent_str = (
+        f"{parent.get('key')} ({(parent.get('fields') or {}).get('summary', '')})"
+        if parent else "none"
+    )
+    return (
+        f"{key}  [{itype}]  {summary}\n"
+        f"  Status:     {status_str}\n"
+        f"  Assignee:   {assignee}\n"
+        f"  Reporter:   {reporter}\n"
+        f"  Priority:   {priority}\n"
+        f"  Resolution: {resolution}\n"
+        f"  Parent:     {parent_str}\n"
+        f"  Created:    {f.get('created', 'n/a')}\n"
+        f"  Updated:    {f.get('updated', 'n/a')}\n"
+        f"  URL:        {_jira_browse_url(key)}"
+    )
+
+
+@mcp.tool()
+def get_jira_issue(issue_key: str) -> str:
+    """Get the current status and details of a single Jira ticket, story, or epic.
+
+    Use this for questions like "what's the status of DEV-16397" or "who is
+    PROJ-42 assigned to". Works for any issue type (Task, Story, Bug, Epic, …).
+
+    Args:
+        issue_key: The Jira issue key, e.g. "DEV-16397" or "PROJ-42".
+    """
+    key = issue_key.strip().upper()
+    if not key:
+        return "Please provide a Jira issue key, e.g. 'DEV-16397'."
+    try:
+        data = _jira_get(
+            f"/rest/api/3/issue/{key}",
+            {
+                "fields": (
+                    "summary,status,issuetype,assignee,reporter,priority,"
+                    "resolution,parent,created,updated"
+                )
+            },
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    return _fmt_jira_issue(data, detailed=True)
+
+
+@mcp.tool()
+def list_issues_by_assignee(
+    assignee: str,
+    status: str = "all",
+    issue_type: str = "all",
+    limit: int = 15,
+) -> str:
+    """List the Jira tickets, stories, or epics assigned to a particular user.
+
+    Use this for "what is <person> working on", "show <person>'s open stories",
+    or "which tasks are assigned to <email>". Results are newest-updated first.
+
+    Args:
+        assignee: The user's email or display name, e.g. "jane@bechprep.com"
+            or "Jane Doe". Resolved to their Jira account automatically.
+        status: Filter by status, comma-separated (e.g. "In Progress" or
+            "To Do,In Progress"). Use "all" for every status.
+        issue_type: Filter by type, comma-separated (e.g. "Story" or
+            "Story,Epic,Task"). Use "all" for every type.
+        limit: Maximum number of issues to return (1-50).
+    """
+    limit = max(1, min(limit, 50))
+    try:
+        account_id, label = _resolve_assignee(assignee)
+    except RuntimeError as exc:
+        return str(exc)
+    if not account_id:
+        return (
+            f"No Jira user found matching {assignee!r}. Try their exact email "
+            "address or full display name."
+        )
+
+    clauses = [f'assignee = "{account_id}"']
+    status_clause = _jql_in_clause("status", status)
+    if status_clause:
+        clauses.append(status_clause)
+    type_clause = _jql_in_clause("issuetype", issue_type)
+    if type_clause:
+        clauses.append(type_clause)
+    jql = " AND ".join(clauses) + " ORDER BY updated DESC"
+
+    try:
+        data = _jira_get(
+            "/rest/api/3/search/jql",
+            {
+                "jql": jql,
+                "maxResults": limit,
+                "fields": "summary,status,issuetype,assignee,priority,updated",
+            },
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 400:
+            return (
+                f"Jira rejected the query (400). Check the status/type filters — "
+                f"JQL was: {jql}"
+            )
+        raise
+
+    issues = data.get("issues", []) if isinstance(data, dict) else []
+    if not issues:
+        filt = []
+        if status.lower() != "all":
+            filt.append(f"status={status}")
+        if issue_type.lower() != "all":
+            filt.append(f"type={issue_type}")
+        suffix = f" ({', '.join(filt)})" if filt else ""
+        return f"No issues assigned to {label}{suffix}."
+
+    header = f"Issues assigned to {label} (showing {len(issues)}):"
+    lines = [header, ""]
+    lines.extend(_fmt_jira_issue(i) for i in issues)
     return "\n".join(lines)
 
 

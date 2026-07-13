@@ -29,6 +29,8 @@ TOOL_INFO: dict[str, tuple[str, str]] = {
     "list_collaborators":  ("◍", "Users with access to a repo & their roles"),
     "search_commits_by_ticket": ("⌗", "Find commits by ticket id (DEV-#####)"),
     "list_pull_requests":  ("⎇", "Open / merged / closed pull requests"),
+    "get_jira_issue":      ("◇", "Jira status of a ticket / story / epic"),
+    "list_issues_by_assignee": ("☰", "Jira issues assigned to a user"),
 }
 
 
